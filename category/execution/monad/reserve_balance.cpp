@@ -119,12 +119,6 @@ bool dipped_into_reserve(
             if (addr == sender) {
                 if (!can_sender_dip_into_reserve(
                         sender, i, effective_is_delegated, ctx)) {
-                    // Safety: this assertion is recoverable because it can be
-                    // triggered via RPC parameter setting.
-                    MONAD_ASSERT_THROW(
-                        violation_threshold.has_value(),
-                        "gas fee greater than reserve for non-dipping "
-                        "transaction");
                     return true;
                 }
                 // Skip if allowed to dip into reserve
@@ -244,9 +238,6 @@ void ReserveBalance::update_violation_status(Address const &address)
                 failed_.erase(address);
                 return;
             }
-            MONAD_ASSERT_THROW(
-                sender_gas_fees_ <= reserve,
-                "gas fee greater than reserve for non-dipping transaction");
             reserve = reserve - sender_gas_fees_;
         }
         violation_threshold = reserve;
