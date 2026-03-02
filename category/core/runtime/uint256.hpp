@@ -15,8 +15,6 @@
 
 #pragma once
 
-#include <category/vm/core/assert.h>
-
 #include <algorithm>
 #include <bit>
 #include <climits>
@@ -35,6 +33,10 @@
 #ifndef __BMI2__
     #error "Target architecture must support BMI2 (for MULX)"
 #endif
+
+#define MONAD_VM_DEBUG_ASSERT(_x)
+#define MONAD_VM_ASSERT(_x)
+#define MONAD_VM_UNLIKELY(x) (x)
 
 // GCC's overeager SLP vectorizer sometimes pessimizes code. For functions that
 // are particularly sensitive about this (such as multiplication), the
@@ -675,10 +677,14 @@ namespace monad::vm::runtime
             std::memcpy(dest, &words_, num_bytes);
         }
 
-        // String conversion functions
-        // These are not optimized and should never be used in
-        // performance-critical code.
-        inline std::string to_string(int const base0) const;
+        // Encode a uint256_t into its representation in arbitrary base.
+        // This is only done efficiently in bases 2, 4, 10 and 16.
+        [[gnu::always_inline]]
+        inline constexpr std::string to_string(uint const base) const;
+
+        // Parse a uint256_t from a decimal or hexadecimal base. This
+        // function has not been optimized and should not be used in
+        // performance critical code.
         static inline constexpr uint256_t from_string(char const *s);
 
         [[gnu::always_inline]] static inline constexpr uint256_t
@@ -1060,6 +1066,17 @@ namespace monad::vm::runtime
             quot[ix] = r.quot;
         }
         return r.rem;
+    }
+
+    template <size_t M>
+    inline constexpr div_result<words_t<M>, uint64_t>
+    long_div(words_t<M> const &u, uint64_t v)
+    {
+        MONAD_VM_DEBUG_ASSERT(m);
+        MONAD_VM_DEBUG_ASSERT(v);
+        div_result<words_t<M>, uint64_t> result{.quot = {0}, .rem = 0};
+        result.rem = long_div(M, &u[0], v, &result.quot[0]);
+        return result;
     }
 
     constexpr void knuth_div(
@@ -1529,28 +1546,218 @@ namespace monad::vm::runtime
         return from_dec(chr);
     }
 
-    inline std::string uint256_t::to_string(int const base0 = 10) const
+    namespace
     {
-        MONAD_VM_ASSERT(base0 >= 2 && base0 <= 36);
+        inline constexpr std::string
+        to_string_generic(uint256_t const &_num, uint const base = 10)
+        {
+            MONAD_VM_ASSERT(base0 >= 2 && base0 <= 36);
+            std::string buffer;
+            auto num = _num.as_words();
+            do {
+                auto const [div, lsw] = long_div<4ul>(num, base);
+                auto const chr = lsw < 10 ? '0' + lsw : 'a' + lsw - 10;
+                buffer.push_back(static_cast<char>(chr));
+                num = div;
+            }
+            while ((num[0] || num[1]) || (num[2] || num[3]));
+            std::ranges::reverse(buffer);
 
-        auto num = *this;
-        auto const base = uint256_t{base0};
-
-        std::string buffer{};
-        do {
-            auto const [div, rem] = udivrem(num, base);
-            auto const lsw = rem[0];
-            auto const chr = lsw < 10 ? '0' + lsw : 'a' + lsw - 10;
-            buffer.push_back(static_cast<char>(chr));
-            num = div;
+            return buffer;
         }
-        while (num);
-        std::ranges::reverse(buffer);
 
-        return buffer;
+        inline constexpr std::array<char, 512> digits_00_ff = []() {
+            auto const nibble_to_hex = [](char nibble) -> char {
+                return static_cast<char>(
+                    nibble < 10 ? '0' + nibble : 'a' + (nibble - 10));
+            };
+            std::array<char, 512> table{};
+            for (size_t i = 0; i < 256; i++) {
+                table[i * 2] = nibble_to_hex(static_cast<char>(i >> 4));
+                table[i * 2 + 1] = nibble_to_hex(static_cast<char>(i & 15));
+            }
+            return table;
+        }();
+
+        inline constexpr std::string to_string_base_16(uint256_t const &x)
+        {
+            auto const num_bits = bit_width(x);
+            if (num_bits == 0) {
+                return "0";
+            }
+            auto const num_nibbles = (num_bits + 3) / 4;
+
+            auto const num_digits =
+                std::max(static_cast<size_t>(1), num_nibbles);
+            std::string buffer{};
+            buffer.resize(num_digits);
+
+            auto const num_words = (num_bits + 63) / 64;
+            auto const msw_i = (num_bits - 1) / 64;
+            auto const num_nibbles_in_msw = (((num_nibbles)-1) % 16) + 1;
+
+            size_t digit_i = num_nibbles - 1;
+            for (size_t word_i = 0; word_i < num_words - 1; word_i++) {
+                uint64_t word = x.as_words()[word_i];
+                for (size_t i = 0; i < 8; i++) {
+                    auto const byte = word & 255;
+                    std::memcpy(
+                        &buffer[digit_i - 1], &digits_00_ff[byte * 2], 2);
+                    digit_i -= 2;
+                    word >>= 8;
+                }
+            }
+            uint64_t msw = x.as_words()[msw_i];
+            for (size_t i = 0; i < num_nibbles_in_msw / 2; i++) {
+                auto const byte = msw & 255;
+                std::memcpy(&buffer[digit_i - 1], &digits_00_ff[byte * 2], 2);
+                digit_i -= 2;
+                msw >>= 8;
+            }
+            if (num_nibbles_in_msw % 2 == 1) {
+                auto const nibble = msw & 15;
+                buffer[digit_i] = digits_00_ff[nibble * 2 + 1];
+            }
+
+            return buffer;
+        }
+
+        [[gnu::always_inline]]
+        static inline __m256i avx2_divmod_10000(__m256i x)
+        {
+            constexpr uint32_t div_multiplier = 0xd1b71759;
+            constexpr size_t div_shift = 45;
+            __m256i quot = _mm256_srli_epi64(
+                _mm256_mul_epu32(
+                    x, _mm256_set1_epi32(static_cast<int32_t>(div_multiplier))),
+                div_shift);
+            __m256i rem = _mm256_sub_epi32(
+                x, _mm256_mul_epu32(quot, _mm256_set1_epi32(10000)));
+            return _mm256_or_si256(quot, _mm256_slli_epi64(rem, 32));
+        }
+
+        [[gnu::always_inline]]
+        static inline __m256i avx2_divmod_100(__m256i x)
+        {
+            constexpr uint16_t div_multiplier = 0x147b;
+            constexpr size_t div_shift = 3;
+            __m256i quot = _mm256_srli_epi16(
+                _mm256_mulhi_epu16(x, _mm256_set1_epi16(div_multiplier)),
+                div_shift);
+            __m256i rem = _mm256_sub_epi16(
+                x, _mm256_mullo_epi16(quot, _mm256_set1_epi16(100)));
+            return _mm256_or_si256(quot, _mm256_slli_epi32(rem, 16));
+        }
+
+        [[gnu::always_inline]]
+        static inline __m256i avx2_divmod_10(__m256i x)
+        {
+            constexpr uint16_t div_multiplier = 0x199a;
+            __m256i quot =
+                _mm256_mulhi_epu16(x, _mm256_set1_epi16(div_multiplier));
+            __m256i rem = _mm256_sub_epi16(
+                x, _mm256_mullo_epi16(quot, _mm256_set1_epi16(10)));
+            return _mm256_or_si256(quot, _mm256_slli_epi16(rem, 8));
+        }
+
+        [[gnu::always_inline]]
+        static inline __m128i digits16_to_ascii_avx2(uint32_t hi, uint32_t lo)
+        {
+            __m256i x = _mm256_set_epi64x(0, 0, lo, hi);
+
+            // 2 base 100'000'000 digits -> 4 base 10'000 digits
+            __m256i digits_10000 = avx2_divmod_10000(x);
+
+            // 4 base 10'000 digits -> 8 base 100 digits
+            __m256i digits_100 = avx2_divmod_100(digits_10000);
+
+            // 8 base 100 digits -> 16 base 10 digits
+            __m256i digits_10 = avx2_divmod_10(digits_100);
+
+            __m256i ascii = _mm256_add_epi8(digits_10, _mm256_set1_epi8('0'));
+            return _mm256_castsi256_si128(ascii);
+        }
+
+        /*
+        template <bool print_leading_zeros>
+        inline void write_base10_avx2(uint64_t x, std::string &buffer)
+        {
+            size_t digits_base10;
+            if constexpr (print_leading_zeros) {
+                digits_base10 = 19;
+            }
+            else {
+                digits_base10 = num_digits_base10_countlz(x);
+            }
+            size_t I = buffer.length();
+            buffer.resize(I + digits_base10);
+
+            if constexpr (!print_leading_zeros) {
+                if (x < 1000) {
+                    if (x >= 10) {
+                        if (x >= 100) {
+                            buffer[I + digits_base10 - 3] = digits_0_9[x / 100];
+                            x = x % 100;
+                        }
+                        std::memcpy(
+                            &buffer[I + digits_base10 - 2],
+                            &digits_00_99[x * 2],
+                            2);
+                    }
+                    else if (x) {
+                        buffer[I + digits_base10 - 1] = digits_0_9[x];
+                    }
+                    return;
+                }
+            }
+            uint64_t head = x / 1000;
+            uint64_t tail = x % 1000;
+
+            // Print tail unconditionally
+            buffer[I + digits_base10 - 3] = digits_0_9[tail / 100];
+            tail = tail % 100;
+            std::memcpy(
+                &buffer[I + digits_base10 - 2], &digits_00_99[tail * 2], 2);
+
+            auto head_hi = uint32_t(head / 100'000'000);
+            auto head_lo = uint32_t(head % 100'000'000);
+            __m128i head_digits = digits16_to_ascii_avx2(head_hi, head_lo);
+
+            if constexpr (print_leading_zeros) {
+                _mm_storeu_si128(
+                    reinterpret_cast<__m128i *>(&buffer[I]), head_digits);
+            }
+            else {
+                alignas(16) char scratch[16];
+                _mm_store_si128(
+                    reinterpret_cast<__m128i *>(scratch), head_digits);
+                std::memcpy(
+                    &buffer[I],
+                    &scratch[16 - (digits_base10 - 3)],
+                    digits_base10 - 3);
+            }
+        }
+
+        */
+        inline constexpr std::string to_string_base_10(uint256_t const &x) {
+            return to_string_generic(x, 10);
+        }
     }
 
-    inline constexpr uint256_t uint256_t::from_string(char const *const str)
+    inline constexpr std::string
+    uint256_t::to_string(uint const base = 10) const
+    {
+        switch (base) {
+        case 10:
+            return to_string_base_10(*this);
+        case 16:
+            return to_string_base_16(*this);
+        default:
+            return to_string_generic(*this, base);
+        }
+    }
+
+    inline constexpr uint256_t uint256_t::from_string(char const *str)
     {
         static constexpr uint256_t MAX_MULTIPLIABLE_BY_10 =
             std::numeric_limits<uint256_t>::max() / 10;
